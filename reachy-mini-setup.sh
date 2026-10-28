@@ -42,6 +42,12 @@ GST_INSTALL_DIR="/opt/gst-plugins-rs"
 # Stable device node for the robot's USB serial adapter (created by udev).
 SERIAL_SYMLINK="/dev/reachy_mini"
 
+# CPU clock cap in MHz. The Wireless CM4 runs at 1500 MHz; a Pi 4B rev 1.4+
+# boots at 1800 MHz because Pi OS ships arm_boost=1. Set to match the CM4
+# (less heat and power), or leave empty to keep the Pi OS default (more
+# headroom for the software video encoder).
+ARM_FREQ_MHZ="1500"
+
 # --- Detect user -------------------------------------------------------------
 ACTUAL_USER=$(getent passwd 1000 | cut -d: -f1)
 ACTUAL_HOME="/home/$ACTUAL_USER"
@@ -50,7 +56,7 @@ VENV_DIR="$ACTUAL_HOME/reachy_mini/.venv"
 echo "=== Installing Reachy Mini daemon for user: $ACTUAL_USER ==="
 
 # --- System packages ---------------------------------------------------------
-echo "[1/7] Installing system packages..."
+echo "[1/8] Installing system packages..."
 
 # Same GStreamer/ALSA stack as the official Wireless image
 # (reachy-mini-os stage2/01-sys-tweaks/00-packages-nr), without the camera
@@ -96,7 +102,7 @@ apt_install || {
 apt-get clean
 
 # --- GStreamer WebRTC plugins (pre-built) ------------------------------------
-echo "[2/7] Installing pre-built GStreamer WebRTC plugins..."
+echo "[2/8] Installing pre-built GStreamer WebRTC plugins..."
 TARBALL="$(mktemp /tmp/gst-plugins-rs.XXXXXX.tar.gz)"
 if ! curl -fL --retry 3 -o "$TARBALL" "$GST_PLUGINS_RS_URL"; then
     echo "ERROR: GStreamer plugin download failed. Check internet connectivity and GST_PLUGINS_RS_URL."
@@ -123,7 +129,7 @@ DefaultEnvironment="UV_GIT_LFS=1"
 EOF
 
 # --- Python environment & daemon --------------------------------------------
-echo "[3/7] Installing uv and daemon..."
+echo "[3/8] Installing uv and daemon..."
 sudo -u "$ACTUAL_USER" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
 UV="$ACTUAL_HOME/.local/bin/uv"
 
@@ -143,7 +149,7 @@ echo "  Installing: $SPEC"
 sudo -u "$ACTUAL_USER" env UV_GIT_LFS=1 "$UV" pip install --python "$VENV_DIR/bin/python" "$SPEC"
 
 # --- udev rules --------------------------------------------------------------
-echo "[4/7] Configuring udev rules..."
+echo "[4/8] Configuring udev rules..."
 cat > /etc/udev/rules.d/99-reachy-mini.rules <<UDEV
 # Robot body: CH343 USB serial (cdc-acm). Stable symlink for --serialport.
 SUBSYSTEM=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", MODE="0666"
@@ -156,8 +162,31 @@ UDEV
 udevadm control --reload-rules && udevadm trigger
 usermod -aG dialout,audio,plugdev "$ACTUAL_USER"
 
+# --- CPU clock ---------------------------------------------------------------
+echo "[5/8] Configuring CPU clock..."
+CONFIG_TXT=/boot/firmware/config.txt
+# Remove a previous block from this script (idempotent re-runs), then append.
+if grep -q "^# BEGIN reachy-mini clock" "$CONFIG_TXT" 2>/dev/null; then
+    sed -i "/^# BEGIN reachy-mini clock/,/^# END reachy-mini clock/d" "$CONFIG_TXT"
+fi
+if [[ -n "$ARM_FREQ_MHZ" ]]; then
+    cat >> "$CONFIG_TXT" <<EOF
+# BEGIN reachy-mini clock
+# Match the Reachy Mini Wireless CM4 clock. Later entries override the
+# arm_boost=1 that Pi OS sets above. Delete this block for the Pi default.
+[pi4]
+arm_boost=0
+arm_freq=${ARM_FREQ_MHZ}
+[all]
+# END reachy-mini clock
+EOF
+    echo "  CPU capped at ${ARM_FREQ_MHZ} MHz (takes effect after reboot)."
+else
+    echo "  ARM_FREQ_MHZ empty: keeping Pi OS default clock."
+fi
+
 # --- Scoped passwordless sudo ------------------------------------------------
-echo "[5/7] Granting scoped sudo..."
+echo "[6/8] Granting scoped sudo..."
 # The daemon's "restart" action and the wireless startup checks shell out to
 # sudo with no TTY. Grant only the fixed commands they need (same approach as
 # the official image; it uses more because it also manages BLE/WiFi).
@@ -173,7 +202,7 @@ chmod 0440 /etc/sudoers.d/010-reachy-mini
 visudo -cf /etc/sudoers.d/010-reachy-mini
 
 # --- systemd service ---------------------------------------------------------
-echo "[6/7] Creating systemd service..."
+echo "[7/8] Creating systemd service..."
 # --wireless-version: bind the API on all interfaces, advertise the Pi's
 #   wlan0 IP so SDK clients know where the WebRTC signalling server is, and
 #   use ALSA via ~/.asoundrc (the daemon writes it on first start).
@@ -207,7 +236,7 @@ systemctl daemon-reload
 systemctl enable reachy-mini-daemon
 
 # --- Version marker ----------------------------------------------------------
-echo "[7/7] Finalizing..."
+echo "[8/8] Finalizing..."
 INSTALLED_VERSION=$(sudo -u "$ACTUAL_USER" "$UV" pip show --python "$VENV_DIR/bin/python" reachy-mini 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
 cat > "$ACTUAL_HOME/VERSION.txt" <<EOF
 reachy-mini-daemon: ${INSTALLED_VERSION}

@@ -328,6 +328,7 @@ different, and that drives every choice below.
 | Audio | "Reachy Mini Audio" USB board via ALSA (`~/.asoundrc`) | same board, same ALSA path |
 | IMU | BMI088 on I2C bus 4 | none (daemon logs a warning and continues) |
 | Power switch | GPIO shutdown service | none |
+| CPU clock | CM4 at 1.5 GHz | Pi 4B rev 1.4+ boots at 1.8 GHz; the script caps it to 1.5 GHz (`ARM_FREQ_MHZ`) |
 | WiFi setup | BLE provisioning service + `nmcli` | done by Imager / cloud-init |
 | Layout | user `pollen`, `/venvs/mini_daemon`, `/restore`, `/bluetooth`, `/opt/uv` | your user, `~/reachy_mini/.venv`, `~/.local/bin/uv` |
 
@@ -488,6 +489,7 @@ name will not be picked up.
 | `DAEMON_SOURCE` | Git URL or absolute path to install instead of PyPI, e.g. `git+https://github.com/your-fork/reachy_mini@my-branch` or `/boot/firmware/reachy_mini_src` (copy the repo to the SD card first). Installed as `reachy-mini[wireless-version] @ <source>`. |
 | `GST_PLUGINS_RS_URL` / `_SHA256` | Pre-built plugin tarball. Copy both from `stage2/05-reachy-mini/files/gst-plugins-rs.pin` in `reachy-mini-os` when they bump it. |
 | `SERIAL_SYMLINK` | Device node the udev rule creates and the service passes to `--serialport`. |
+| `ARM_FREQ_MHZ` | CPU clock cap written to `/boot/firmware/config.txt` (default `1500` to match the CM4). Empty keeps the Pi OS default, which gives the software video encoder more headroom. Re-run the script or edit the `reachy-mini clock` block in `config.txt` by hand, then reboot. |
 
 After editing, re-run `prepare-sd-card.sh --force` (or `-Force`) to copy the
 new script to the card, or on a running Pi:
