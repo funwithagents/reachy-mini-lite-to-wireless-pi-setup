@@ -25,7 +25,7 @@ robot, just power to both devices and a shared WiFi network.
 | microSD card | 16 GB minimum, 32 GB recommended (Class 10 / A1) |
 | USB-A to USB-C cable | To connect the Pi to Reachy Mini |
 | Power supply for the Pi | Official 5 V / 3 A USB-C recommended |
-| Windows or Linux PC | For flashing and SD card preparation |
+| Windows, Linux or macOS PC | For flashing and SD card preparation |
 | [Raspberry Pi Imager](https://www.raspberrypi.com/software/) | Install before starting |
 
 ---
@@ -64,7 +64,8 @@ Click **Save**, then **Yes** to apply settings, then confirm to write.
 > Pi OS Trixie (Nov 2025+) uses **cloud-init** instead of `firstrun.sh`.
 > Imager writes `user-data` and `network-config` files to the boot partition
 > containing your WiFi credentials, user account, and SSH settings.
-> The script installs the deamon from this repo so it runs automatically on second boot.
+> The `prepare-sd-card` script appends the installer from this repo to that
+> `user-data`, so it runs automatically during the first boot.
 
 
 ## Step 2 — Prepare the SD card for automatic setup
@@ -110,6 +111,15 @@ sudo mount /dev/sdX1 /mnt/bootfs   # replace sdX1 with your SD card's first part
 Use `lsblk` to identify the correct device.
 </details>
 
+<details>
+<summary><strong>macOS</strong></summary>
+
+macOS auto-mounts the boot partition at `/Volumes/bootfs`. If it does not
+appear, run `diskutil list` to find the card and `diskutil mount <identifier>`
+to mount its first (FAT32) partition. macOS will show a "disk not readable"
+dialog for the Linux (ext4) partition — click **Ignore**.
+</details>
+
 ### 2b — Run the preparation script
 
 <details>
@@ -118,7 +128,6 @@ Use `lsblk` to identify the correct device.
 Open **PowerShell** (no Administrator needed) and run:
 
 ```powershell
-cd setup\wireless-pi4
 .\prepare-sd-card.ps1
 ```
 
@@ -140,19 +149,21 @@ ambiguous or fails, pass the drive letter you assigned above:
 </details>
 
 <details>
-<summary><strong>Linux (Bash)</strong></summary>
+<summary><strong>Linux / macOS (Bash)</strong></summary>
 
 ```bash
-cd setup/wireless-pi4
 chmod +x prepare-sd-card.sh
 ./prepare-sd-card.sh
 ```
 
-The script auto-detects the mounted `bootfs` partition. If detection fails,
-pass the mount point explicitly:
+The script auto-detects the mounted `bootfs` partition (`/media/$USER/bootfs`
+or `/mnt/bootfs` on Linux, `/Volumes/bootfs` on macOS). It only needs bash 3.2+
+and awk, so it runs unchanged on macOS. If detection fails, pass the mount
+point explicitly:
 
 ```bash
-./prepare-sd-card.sh /media/$USER/bootfs
+./prepare-sd-card.sh /media/$USER/bootfs    # Linux
+./prepare-sd-card.sh /Volumes/bootfs         # macOS
 ```
 
 > **Updating the installer after a card is already prepared**  
@@ -168,6 +179,7 @@ You should see output ending with `SD card preparation complete.`
 
 - **Windows**: In Windows Explorer right-click the boot partition drive → **Eject**.
 - **Linux**: `sudo umount /media/$USER/bootfs` (or the mount point shown by the script), then remove the card.
+- **macOS**: `diskutil unmount /Volumes/bootfs` (or eject it from Finder), then remove the card.
 
 ---
 
