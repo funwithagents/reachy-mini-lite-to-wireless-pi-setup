@@ -124,7 +124,8 @@ if ($Force -or -not (Test-Path $SetupScriptPath)) {
 # repo so it matches the GStreamer version apt installs on Trixie.
 
 # Inject runcmd entry into user-data for cloud-init
-$RuncmdEntry = "  - [ bash, /boot/firmware/reachy-mini-setup.sh ]"
+$RuncmdItem = "- [ bash, /boot/firmware/reachy-mini-setup.sh ]"
+$RuncmdEntry = "  $RuncmdItem"
 $RuncmdMarker = "reachy-mini-setup.sh"
 
 # user-data is always written with WriteAllText: it uses UTF-8 without a BOM
@@ -139,8 +140,8 @@ if (-not (Test-Path $UserDataPath)) {
 
     if ($existing -match [regex]::Escape($RuncmdMarker)) {
         if ($Force) {
-            # Replace only the reachy-mini line in-place
-            $updated = $existing -replace "(?m)^[ \t]*-[ \t]*\[?[ \t]*bash,[ \t]*/boot/(firmware/)?reachy-mini-setup\.sh[^\r\n]*", $RuncmdEntry
+            # Replace only the reachy-mini line in-place, keeping its indentation
+            $updated = $existing -replace "(?m)^([ \t]*)-[ \t]*\[?[ \t]*bash,[ \t]*/boot/(firmware/)?reachy-mini-setup\.sh[^\r\n]*", "`$1$RuncmdItem"
             [System.IO.File]::WriteAllText($UserDataPath, $updated)
             Write-Host "Updated existing runcmd entry in user-data."
         } else {
@@ -152,20 +153,30 @@ if (-not (Test-Path $UserDataPath)) {
             # Append as the LAST item of the existing runcmd list. Imager puts
             # `systemctl enable --now ssh` there, and the setup script ends with a
             # reboot, so it must run after everything else cloud-init queued.
+            # The entry copies the indentation of the existing items: a deeper
+            # indent would turn it into a continuation of the previous command.
+            # The list ends at the next top-level key.
             $lines = $existing.TrimEnd("`r", "`n") -split "\r?\n"
             $out = New-Object System.Collections.Generic.List[string]
             $inRuncmd = $false
+            $indent = $null
             foreach ($line in $lines) {
                 if ($line -match "^runcmd:") {
                     $inRuncmd = $true
-                } elseif ($inRuncmd -and $line -notmatch "^\s*-" -and $line -notmatch "^\s*$") {
-                    $out.Add($RuncmdEntry)
-                    $inRuncmd = $false
+                } elseif ($inRuncmd) {
+                    if ($line -match "^[^\s#-]") {
+                        if ($null -eq $indent) { $indent = "  " }
+                        $out.Add("$indent$RuncmdItem")
+                        $inRuncmd = $false
+                    } elseif ($null -eq $indent -and $line -match "^(\s*)-") {
+                        $indent = $Matches[1]
+                    }
                 }
                 $out.Add($line)
             }
             if ($inRuncmd) {
-                $out.Add($RuncmdEntry)
+                if ($null -eq $indent) { $indent = "  " }
+                $out.Add("$indent$RuncmdItem")
             }
             [System.IO.File]::WriteAllText($UserDataPath, ($out -join "`n") + "`n")
             Write-Host "Appended runcmd entry to existing runcmd section in user-data."

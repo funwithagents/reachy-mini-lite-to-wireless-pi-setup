@@ -113,7 +113,8 @@ fi
 # No `sed -i` here: GNU and BSD (macOS) sed disagree on its syntax, so edits go
 # through awk into a temp file that then replaces user-data.
 USER_DATA="$BOOT_PATH/user-data"
-RUNCMD_ENTRY="  - [ bash, /boot/firmware/reachy-mini-setup.sh ]"
+RUNCMD_ITEM="- [ bash, /boot/firmware/reachy-mini-setup.sh ]"
+RUNCMD_ENTRY="  $RUNCMD_ITEM"
 RUNCMD_MARKER="reachy-mini-setup.sh"
 
 write_user_data() {
@@ -131,8 +132,11 @@ if [[ ! -f "$USER_DATA" ]]; then
     echo "Created user-data with runcmd entry."
 elif grep -q "$RUNCMD_MARKER" "$USER_DATA"; then
     if [[ "$FORCE" == true ]]; then
-        awk -v entry="$RUNCMD_ENTRY" '
-            /bash.*\/boot\/firmware\/reachy-mini-setup\.sh/ { print entry; next }
+        # Keep the line's own indentation; also upgrade the old /boot/ path
+        awk -v item="$RUNCMD_ITEM" '
+            /bash.*\/boot\/(firmware\/)?reachy-mini-setup\.sh/ {
+                match($0, /^[[:space:]]*/); print substr($0, 1, RLENGTH) item; next
+            }
             { print }
         ' "$USER_DATA" | write_user_data
         echo "Updated existing runcmd entry in user-data."
@@ -144,11 +148,18 @@ else
         # Append as the LAST item of the existing runcmd list. Imager puts
         # `systemctl enable --now ssh` there, and the setup script ends with a
         # reboot, so it must run after everything else cloud-init queued.
-        awk -v entry="$RUNCMD_ENTRY" '
+        # The entry copies the indentation of the existing items: a deeper
+        # indent would turn it into a continuation of the previous command.
+        # The list ends at the next top-level key.
+        awk -v item="$RUNCMD_ITEM" '
+            function emit() { print (seen ? indent : "  ") item }
             /^runcmd:/ { in_runcmd = 1; print; next }
-            in_runcmd && !/^[[:space:]]*-/ && !/^[[:space:]]*$/ { print entry; in_runcmd = 0 }
+            in_runcmd && /^[^[:space:]#-]/ { emit(); in_runcmd = 0 }
+            in_runcmd && !seen && /^[[:space:]]*-/ {
+                match($0, /^[[:space:]]*/); indent = substr($0, 1, RLENGTH); seen = 1
+            }
             { print }
-            END { if (in_runcmd) print entry }
+            END { if (in_runcmd) emit() }
         ' "$USER_DATA" | write_user_data
         echo "Appended runcmd entry to existing runcmd section in user-data."
     else
