@@ -183,47 +183,73 @@ You should see output ending with `SD card preparation complete.`
 
 ---
 
-## Step 3 — First boot (WiFi and SSH setup)
+## Step 3 — First boot (WiFi, SSH and automatic installation)
 
 1. Insert the SD card into the Raspberry Pi 4B.
 2. Connect the Pi to Reachy Mini via the USB cable
    (USB-A on the Pi → USB-C on Reachy Mini).
 3. Power on the Raspberry Pi.
 
-**What happens on first boot (~1-2 minutes):**
-- cloud-init runs: sets up your user, password, WiFi, SSH, and registers the
-  Reachy Mini installer as a one-shot systemd service.
-- The Pi reboots automatically.
+There is a single install boot. Everything below is driven by **cloud-init**,
+the first-boot configuration tool built into Pi OS Trixie, reading the
+`user-data` and `network-config` files that Imager and `prepare-sd-card`
+wrote to the boot partition. There is no separate installer service.
+
+**What happens on first boot:**
+
+1. *(~1-2 minutes)* cloud-init brings up WiFi, creates your user and password,
+   sets the hostname, timezone and keyboard, installs `avahi-daemon` (for
+   `<hostname>.local` resolution) and enables SSH. From this point you can
+   SSH in.
+2. *(~15 minutes, depending on internet connection and SD card)* cloud-init
+   runs the last `runcmd` entry: `bash /boot/firmware/reachy-mini-setup.sh`.
+   This runs as root, in the foreground, and does the whole install (no Rust
+   compilation — the GStreamer plugins are pre-built):
+   - apt installs GStreamer, ALSA utilities and build tools (same stack as the official Wireless image)
+   - downloads the pre-built GStreamer WebRTC plugins from the `reachy-mini-os` GitHub releases (sha256-verified) into `/opt/gst-plugins-rs/`
+   - installs `uv`, creates a Python 3.12 venv and installs `reachy-mini[wireless-version]` at the pinned version
+   - writes udev rules for the robot's USB serial adapter (stable `/dev/reachy_mini` symlink) and audio board
+   - grants your user a few scoped passwordless `sudo` commands the daemon needs
+   - creates and enables the `reachy-mini-daemon` systemd service, running in wireless mode
+   - writes `~/VERSION.txt`
+3. The script reboots the Pi. The daemon starts for the first time on that
+   reboot.
+
+cloud-init marks the first boot as done, so the install script never runs
+again on later boots. If it fails partway, either re-run it by hand over SSH
+(`sudo bash /boot/firmware/reachy-mini-setup.sh`) or reflash the card.
 
 ---
 
-## Step 4 — Automatic Reachy Mini deamon installation (second boot)
+## Step 4 — Monitoring the installation
 
-After the Pi reboots it connects to WiFi and the installer service starts.
-This takes **15 minutes** depending on your internet connection and SD card (no Rust
-compilation — the GStreamer plugin is pre-built).
+Once SSH is up (a minute or two after power-on) you can watch the install
+live. Use the username and hostname you set in Imager:
 
-The install:
+```bash
+ssh <user>@<hostname>.local "sudo tail -f /var/log/cloud-init-output.log"
+```
 
+This is cloud-init's log of everything its `runcmd` commands print, so it
+contains the full output of `reachy-mini-setup.sh`. It survives the reboot,
+so you can also read it afterwards to diagnose a failed install.
+`/var/log/cloud-init.log` is cloud-init's own internal log, useful if the
+install never started at all (WiFi or `user-data` parsing problems).
 
-### Monitoring progress
-
-Once the Pi is on your network you can SSH in and watch the log:
-
-ssh pollen@192.168.0.116 "tail -f /tmp/reachy-install.log"
-# password: root
-
-> If `raspberrypi.local` doesn't resolve, find the IP address from your
+> If `<hostname>.local` doesn't resolve, find the IP address from your
 > router's DHCP client list, or scan with `nmap -sn 192.168.1.0/24`.
 
 A successful install ends with a line like:
 ```
-[...] === Reachy Mini setup complete! Rebooting in 5 seconds... ===
+=== Reachy Mini setup complete! Rebooting in 5 seconds... ===
 ```
 
-After the final reboot, `~/VERSION.txt` on the Pi shows the installed
-version:
+The SSH session drops when the Pi reboots. After it comes back up,
+`~/VERSION.txt` on the Pi shows the installed daemon version:
 
+```bash
+ssh <user>@<hostname>.local cat VERSION.txt
+```
 
 ---
 
