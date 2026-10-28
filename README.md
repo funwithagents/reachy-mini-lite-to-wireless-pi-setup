@@ -258,12 +258,36 @@ ssh <user>@<hostname>.local cat VERSION.txt
 After the install reboot:
 
 ```bash
-ssh pi@raspberrypi.local
+ssh <user>@<hostname>.local
 systemctl status reachy-mini-daemon
 ```
 
-You should see `active (running)`. The daemon listens for connections from
-the Reachy Mini conversation app.
+You should see `active (running)`. From your laptop, check that the daemon is
+in wireless mode and advertises the Pi's WiFi address:
+
+```bash
+curl -s http://<hostname>.local:8000/api/daemon/status | python3 -m json.tool | grep -E 'wireless_version|wlan_ip|error'
+```
+
+Expect `"wireless_version": true`, a non-null `"wlan_ip"` and `"error": null`.
+Some startup-check errors in the journal are normal on this setup; see
+"Things that are expected to log errors" below.
+
+### Quick hardware test (no app needed)
+
+The daemon boots with motors disabled, like the official Wireless image, so
+enable them before asking for a move. Clear space around the head first.
+
+```bash
+R=http://<hostname>.local:8000/api
+curl -X POST $R/volume/test-sound            # speaker
+curl -X POST $R/motors/set_mode/enabled      # torque on
+curl -X POST $R/move/play/wake_up            # head rises, wake-up sound, antennas move
+sleep 8
+curl -X POST $R/move/play/goto_sleep
+```
+
+If the sounds play but nothing moves, the motors are still disabled.
 
 ---
 
@@ -289,230 +313,231 @@ available on your network.
 
 ---
 
-## Platform notes — Raspberry Pi 4B with Pi OS Trixie
+## How this differs from the official Wireless image
 
-Pi OS Trixie (Debian 13, Nov 2025+) differs from the Wireless CM4 image in
-a few ways that affect the daemon. The setup script handles all of this
-automatically; this section explains what was done and why.
+The Reachy Mini Wireless is a Compute Module 4 inside the robot, running the
+image built by [`reachy-mini-os`](https://github.com/pollen-robotics/reachy-mini-os)
+(pi-gen, Pi OS Trixie Lite). This setup reproduces the software side of that
+image on a Pi 4B plugged into a Reachy Mini **Lite** over USB. The hardware is
+different, and that drives every choice below.
 
-### Daemon must bind on all interfaces
+| | Wireless (CM4 inside the robot) | Lite body + this Pi 4B |
+|---|---|---|
+| Motors | UART `/dev/ttyAMA3` | USB CH343 adapter → `/dev/reachy_mini` (udev symlink) |
+| Camera | CSI `imx708`, `libcamerasrc` + hardware H.264 encoder | USB UVC camera, MJPEG decoded and re-encoded **in software** |
+| Audio | "Reachy Mini Audio" USB board via ALSA (`~/.asoundrc`) | same board, same ALSA path |
+| IMU | BMI088 on I2C bus 4 | none (daemon logs a warning and continues) |
+| Power switch | GPIO shutdown service | none |
+| WiFi setup | BLE provisioning service + `nmcli` | done by Imager / cloud-init |
+| Layout | user `pollen`, `/venvs/mini_daemon`, `/restore`, `/bluetooth`, `/opt/uv` | your user, `~/reachy_mini/.venv`, `~/.local/bin/uv` |
 
-By default the daemon binds only to `localhost` (suitable for the desktop
-app running on the same machine). On the Pi the desktop app runs on a
-**different machine**, so the daemon must accept connections from the
-network.
+### Why the daemon runs with `--wireless-version`
 
-The setup script starts the daemon with `--no-localhost-only`:
+The daemon has exactly two network behaviours, selected by this flag
+(`src/reachy_mini/daemon/app/main.py`, `_resolve_bind_host`):
 
-```ini
-ExecStart=/home/pollen/reachy_mini/.venv/bin/reachy-mini-daemon --no-localhost-only
-```
+- **Lite / desktop mode (default)**: the HTTP API binds `127.0.0.1` and the
+  status it reports has `wlan_ip: null`. The SDK client on your laptop uses
+  `wlan_ip` as the WebRTC signalling host and falls back to `localhost` when
+  it is missing — so video and audio would be requested from the **laptop**,
+  not the Pi. `--fastapi-host 0.0.0.0` makes the API reachable but does not
+  fix `wlan_ip`.
+- **Wireless mode**: binds `0.0.0.0`, reports the `wlan0` IP as `wlan_ip`,
+  advertises itself over mDNS as a "Reachy Mini Wireless", enables the
+  wireless-only API routes (update, wifi, cache, logs), and uses ALSA via
+  `~/.asoundrc` for audio (written by the daemon on first start).
 
-Without this flag, `daemon_status.wlan_ip` is `None` and the SDK falls back
-to `ws://localhost:8443` — which resolves to the **user's laptop**, not the
-Pi. WebRTC signaling fails silently and video/audio never stream.
+Earlier daemon releases (≤ 1.8.0) had a `--no-localhost-only` flag that gave
+Lite mode the wireless network behaviour. It was removed in 1.9.0 (July
+2026), so wireless mode is now the only supported way to drive the robot
+from another machine. The two things wireless mode assumes that a Lite body
+cannot provide are handled explicitly:
 
-### PipeWire for audio — same as the CM4 image
+- **Serial port**: wireless mode looks for `/dev/ttyAMA3` and nothing else,
+  so the service passes `--serialport /dev/reachy_mini`, a udev symlink to
+  the Lite's USB adapter (VID:PID `1a86:55d3`).
+- **IMU**: initialisation fails with a logged warning; nothing else depends
+  on it.
 
-Pi OS Trixie Lite ships with **no audio server**. The setup script installs
-`pipewire-audio`, `gstreamer1.0-pipewire`, and `wireplumber` — the same
-stack the official CM4 image uses.
+### Things that are expected to log errors
 
-With PipeWire active, the daemon's stock `find_audio_device()` returns a
-PipeWire `node.name` (e.g.
-`alsa_input.usb-Pollen_Robotics_Reachy_Mini_Audio_…-00.analog-stereo`) and
-uses `pulsesrc` / `pulsesink` through PipeWire-Pulse. **No `.asoundrc` or
-custom ALSA config is needed.**
+On every boot the daemon runs the Wireless "startup checks"
+(`src/reachy_mini/utils/wireless_version/startup_check.py`). They look for
+the fleet layout and try to self-heal it with `sudo`. On this setup they
+log errors and move on; none of them is fatal:
 
-### systemd service needs `XDG_RUNTIME_DIR`
+- `/venvs` does not exist / user `pollen` does not exist (ownership check)
+- `Wireless daemon service has changed, updating...` followed by a `sudo cp`
+  failure: the packaged unit expects `/venvs/mini_daemon`, ours does not,
+  and the scoped sudoers does not allow `cp`. The installed unit is kept.
+- `gpio-shutdown service not installed`, then a `sudo cp` failure
+- `Source bluetooth service` copy failures
 
-PipeWire runs as a **user service** (under `pollen`). The daemon runs as a
-**system service** (under `multi-user.target`). System services don't
-inherit the user session environment, so GStreamer can't find PipeWire's
-socket — it falls back to raw ALSA and returns `hw:` device IDs instead of
-PipeWire node names.
+Likewise the dashboard's **Update** and **WiFi** pages exist but target the
+fleet layout; update the daemon by re-running the setup with a new
+`REACHY_MINI_VERSION` instead.
 
-The fix is a single environment variable in the service file:
+### Audio: ALSA, not PipeWire
 
-```ini
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-```
+The official image installs PipeWire packages but never runs them: the
+daemon is a system service without a user session, and in wireless mode it
+checks `~/.asoundrc` first and uses `alsasrc`/`alsasink` on the `dmix` /
+`dsnoop` aliases defined there. This setup does the same and simply does not
+install PipeWire, so nothing else can hold the card. The volume endpoints
+fall back to `amixer` automatically when no PulseAudio server is present.
 
-Combined with `loginctl enable-linger pollen`, PipeWire's socket at
-`/run/user/1000/pipewire-0` exists from boot and the daemon can connect.
+### Video: expect CPU load
 
-### GStreamer WebRTC plugin — pre-built binary
+The Wireless streams from the CSI camera through the Pi's hardware H.264
+encoder (with a patched `v4l2h264enc` for congestion control). A USB camera
+takes the generic V4L2 path: MJPEG → `jpegdec` → raw → `webrtcsink`, which
+encodes in software. On a Pi 4B this is the main CPU consumer; if the stream
+stutters, lower the camera resolution from the app rather than looking for
+a network problem. The `MALLOC_ARENA_MAX=2` setting from the official unit is
+kept to bound memory growth.
 
-The `gst-plugin-webrtc` Rust crate takes 25+ minutes to compile on a Pi 4B
-and needs >2 GB of free disk. The setup script instead extracts the same
-pre-built `gst-plugins-rs-rpi.tar.gz` tarball used by the official CM4
-pi-gen pipeline — installed to `/opt/gst-plugins-rs/`.
+### GStreamer WebRTC plugins
+
+`webrtcsink`, `webrtcsrc` and `rtpgccbwe` come from `gst-plugins-rs`, which
+is not packaged by Debian. The official image downloads a tarball built by
+`reachy-mini-os` CI against Trixie's GStreamer 1.26 and published as a
+GitHub **release asset** (the tarball used to live in the git tree as an
+LFS file; that path now 404s). The setup script uses the same URL and
+sha256 as `stage2/05-reachy-mini/files/gst-plugins-rs.pin` in that repo.
 
 ---
 
 ## Troubleshooting
 
-### No video in the desktop app
+All daemon output goes to the journal:
 
-1. Check that the daemon is running with `--no-localhost-only`:
+```bash
+journalctl -u reachy-mini-daemon -n 100 --no-pager
+```
+
+### Daemon keeps restarting: "No Reachy Mini serial port found" or cannot open serial port
+
+```bash
+ls -l /dev/reachy_mini          # must point at a ttyACM* device
+lsusb | grep -i 1a86            # the CH343 adapter must be listed
+```
+
+If the symlink is missing, the USB cable or the robot's power is the usual
+cause. Re-trigger udev with `sudo udevadm trigger` after plugging in.
+
+### API reachable but no video or audio in the app
+
+1. Confirm wireless mode and the advertised IP:
    ```bash
-   systemctl show reachy-mini-daemon --property=ExecStart
+   curl -s http://<hostname>.local:8000/api/daemon/status | python3 -m json.tool | grep -E 'wireless_version|wlan_ip'
    ```
-2. Verify the GStreamer WebRTC pipeline started — the IPC socket and
-   signaling port must both be present:
+   `wireless_version` must be `true` and `wlan_ip` must be the Pi's WiFi
+   address. A `null` `wlan_ip` means the Pi is not on `wlan0` (Ethernet-only
+   Pi): the daemon only reads that interface.
+2. The signalling server must listen:
    ```bash
-   ls /tmp/reachymini_camera_socket   # must exist
-   ss -tlnp | grep 8443               # must show LISTEN
+   ss -tlnp | grep 8443
    ```
-3. If either is missing, check daemon logs for GStreamer errors:
+3. The plugins must be visible:
    ```bash
-   journalctl -u reachy-mini-daemon -n 50 --no-pager | grep -iE 'error|warn|alsa|gst'
+   gst-inspect-1.0 webrtcsink && gst-inspect-1.0 rtpgccbwe
    ```
+   (`GST_PLUGIN_PATH` is set for login shells by `/etc/profile.d/reachy-mini-gst.sh`.)
 
-### No audio (speaker silent)
-
-Verify PipeWire sees the device:
-
-```bash
-wpctl status | grep -A5 "Audio"
-```
-
-Test playback through PipeWire:
+### No audio (speaker silent or mic dead)
 
 ```bash
-GST_PLUGIN_PATH=/opt/gst-plugins-rs/lib/aarch64-linux-gnu \
-gst-launch-1.0 audiotestsrc num-buffers=80 \
-  ! audio/x-raw,rate=16000,channels=2,format=S16LE \
-  ! pulsesink
+arecord -l                      # must list "Reachy Mini Audio"
+cat ~/.asoundrc                 # card number must match arecord -l
+speaker-test -D reachymini_audio_sink -c 2 -t wav -l 1
+arecord -D reachymini_audio_src -d 2 -f S16_LE -r 16000 -c 2 /tmp/t.wav
 ```
 
-For deeper GStreamer diagnostics, copy the helper scripts from this folder to the Pi and run them as the `pollen` user (they need the user PipeWire session):
+The daemon rewrites `~/.asoundrc` at start if the card number changed. If
+`arecord -l` shows `Subdevices: 0/1`, the daemon holds the card, which is
+correct while it runs.
+
+### Camera not found
 
 ```bash
-scp test_pipewire_gst.py dump_gst_audio_props.py pollen@<pi-ip>:~
-ssh pollen@<pi-ip> "XDG_RUNTIME_DIR=/run/user/1000 GST_PLUGIN_PATH=/opt/gst-plugins-rs/lib/aarch64-linux-gnu python3 test_pipewire_gst.py"
+gst-device-monitor-1.0 Video/Source | grep -A3 "Reachy"
+v4l2-ctl --list-devices
 ```
 
-- `test_pipewire_gst.py` — checks `pulsesrc`/`pulsesink` work and lists all audio sources/sinks GStreamer sees through PipeWire.
-- `dump_gst_audio_props.py` — dumps every raw property of each audio source device (useful to verify the `node.name` that `find_audio_device()` will return).
-
-If that fails, check PipeWire is running for user pollen:
-
-```bash
-systemctl --user status pipewire wireplumber
-```
-
-### Daemon falls back to ALSA instead of PipeWire
-
-If logs show `Using ALSA dsnoop` or `hw:CARD=Audio`, the daemon can't
-reach PipeWire. Verify:
-
-```bash
-# XDG_RUNTIME_DIR must be set in the service
-systemctl show reachy-mini-daemon --property=Environment | grep XDG
-
-# PipeWire socket must exist
-ls /run/user/1000/pipewire-0
-
-# Linger must be enabled
-loginctl show-user pollen --property=Linger
-```
-
-### Microphone not captured / no audio in WebRTC stream
-
-The capture device should be held by the daemon when the GStreamer pipeline
-is running. Confirm:
-
-```bash
-arecord -l   # Subdevices: 0/1 means the daemon holds it — correct
-```
-
-If `Subdevices: 1/1` (available), the daemon's audio capture pipeline
-crashed. Check daemon logs for errors.
+The detection matches a device whose name contains `Reachy`; a generic UVC
+name will not be picked up.
 
 ---
 
 ## Maintenance — adapting for future OS or daemon releases
-
-This section documents the moving parts so that future revisions are easy.
 
 ### Files in this folder
 
 | File | Purpose |
 |------|---------|
 | `reachy-mini-setup.sh` | Main install script. Runs once on first boot (via cloud-init `runcmd`). |
-| `prepare-sd-card.ps1` | Windows helper to inject the script + tarball into the SD boot partition. |
-| `prepare-sd-card.sh` | Linux helper — same as the PS1 script but for bash. |
+| `prepare-sd-card.ps1` | Windows helper to inject the script into the SD boot partition. |
+| `prepare-sd-card.sh` | Linux / macOS helper — same as the PS1 script but for bash (GNU and BSD tools). |
 | `README.md` | This file. |
 
-### Installing a custom daemon branch (for development)
+### Configuration knobs (top of `reachy-mini-setup.sh`)
 
-To test a fork or unreleased branch of the daemon without publishing to PyPI,
-set `DAEMON_SOURCE` at the top of `reachy-mini-setup.sh` before running
-`prepare-sd-card.ps1` / `prepare-sd-card.sh`:
+| Variable | Meaning |
+|---|---|
+| `REACHY_MINI_VERSION` | Daemon version installed from PyPI. Keep it equal to the SDK version of the app on your laptop. Empty = latest. |
+| `DAEMON_SOURCE` | Git URL or absolute path to install instead of PyPI, e.g. `git+https://github.com/your-fork/reachy_mini@my-branch` or `/boot/firmware/reachy_mini_src` (copy the repo to the SD card first). Installed as `reachy-mini[wireless-version] @ <source>`. |
+| `GST_PLUGINS_RS_URL` / `_SHA256` | Pre-built plugin tarball. Copy both from `stage2/05-reachy-mini/files/gst-plugins-rs.pin` in `reachy-mini-os` when they bump it. |
+| `SERIAL_SYMLINK` | Device node the udev rule creates and the service passes to `--serialport`. |
 
-```bash
-# Install from a git branch
-DAEMON_SOURCE="git+https://github.com/your-fork/reachy_mini@my-branch"
-
-# Install from a local copy placed on the SD card
-# (copy the repo to ./reachy_mini_src/ before running prepare-sd-card)
-DAEMON_SOURCE="/boot/firmware/reachy_mini_src"
-```
-
-`uv pip install` accepts both git URLs and local paths, so both forms work
-with the `[gstreamer]` extra appended automatically. Leave `DAEMON_SOURCE`
-empty (the default) to always install the latest release from PyPI.
+After editing, re-run `prepare-sd-card.sh --force` (or `-Force`) to copy the
+new script to the card, or on a running Pi:
+`sudo bash /boot/firmware/reachy-mini-setup.sh`.
 
 ### What to change when the daemon releases a new version
 
-1. Verify the PyPI extras still match (currently `[gstreamer]`).
-2. If the new daemon requires a newer GStreamer plugin, rebuild the tarball
-   (see "Pre-built GStreamer tarball" below) and commit the new version to
-   the `reachy-mini-os` repo.
+1. Bump `REACHY_MINI_VERSION`, and the app on the laptop to match.
+2. Check `reachy-mini-os` `stage2/05-reachy-mini/01-run-chroot.sh` for the
+   version the official image pins, and `files/gst-plugins-rs.pin` for the
+   plugin tarball. If they moved to a GStreamer newer than Trixie's 1.26,
+   the apt packages here must follow.
+3. Check that `--wireless-version`, `--serialport` and
+   `--no-wake-up-on-start` still exist (`reachy-mini-daemon --help`).
 
 ### What to change for a new Pi OS release
 
 | Concern | Where to look |
-|---------|---------------|
-| PipeWire version / packages | `apt-get install` list in `reachy-mini-setup.sh` — verify package names haven't changed. |
-| cloud-init changes | `prepare-sd-card.ps1` — verify `user-data` YAML format and `runcmd` path still apply. |
-| Default Python version | `uv venv --python 3.12` — bump if the daemon supports a newer Python. |
-| systemd user session path | `XDG_RUNTIME_DIR=/run/user/<UID>` — remains `1000` as long as the user is the first non-root account. |
-| Boot partition mount point | Script checks `/boot/firmware/` for the tarball — Pi OS has used this since Bookworm. |
-
-### Why PipeWire (not raw ALSA or PulseAudio)
-
-- The official CM4 image uses PipeWire → matching it means the **stock
-  daemon code** works with zero modifications.
-- PipeWire handles sample-rate conversion, multi-process access, and
-  device routing automatically — no `.asoundrc` / dsnoop config needed.
-- `loginctl enable-linger` + `XDG_RUNTIME_DIR` in the service file is the
-  only extra wiring needed for a system-level service to reach a user-level
-  PipeWire instance.
+|---|---|
+| GStreamer major version | `apt-cache policy libgstreamer1.0-0` on the Pi must match what the plugin tarball was built against (1.26 today). |
+| cloud-init changes | `prepare-sd-card.*` — verify the `user-data` format and the `runcmd` path. |
+| Default Python version | `uv venv --python 3.12` — bump when the daemon supports newer. |
+| Boot partition mount point | Script reads `/boot/firmware/` — Pi OS has used this since Bookworm. |
+| Network interface name | `wlan_ip` is read from `wlan0`; if the OS renames interfaces, the daemon's `get_ip_address()` default needs a patch. |
 
 ### Key daemon code paths (for debugging)
 
-| File | Function | What it does |
-|------|----------|-------------|
-| `src/reachy_mini/media/device_detection.py` | `find_audio_device()` | Returns `node.name` when PipeWire is available → triggers `pulsesrc` path |
-| `src/reachy_mini/media/media_server.py` | `_build_audio_source()` | If ID doesn't start with `hw:` → uses `pulsesrc` (PipeWire-Pulse) |
-| `src/reachy_mini/media/audio_utils.py` | `has_reachymini_asoundrc()` | Returns `False` when no `.asoundrc` → skips CM4 ALSA path |
+| File | What it does |
+|------|-------------|
+| `daemon/app/main.py` `_resolve_bind_host()` | `0.0.0.0` only with `--wireless-version` |
+| `daemon/daemon.py` (search `wlan_ip`) | Advertised IP, wireless only |
+| `daemon/utils.py` `find_serial_port()` | `/dev/ttyAMA3` in wireless mode, VID/PID scan otherwise |
+| `media/device_detection.py` `find_video_device()` | Camera by name: `Reachy` > `Arducam_12MP` > `imx708` |
+| `media/media_server.py` `_build_audio_source()` | `.asoundrc` present → ALSA; else PipeWire/Pulse via GStreamer device monitor |
+| `media/audio_utils.py` `write_asoundrc_to_home()` | The `dmix`/`dsnoop` config the daemon writes |
+| `utils/wireless_version/startup_check.py` | The boot-time fleet checks that log errors here |
+| `reachy_mini.py` (search `signalling_host`) | Client side: `wlan_ip or "localhost"` |
 
-### Pre-built GStreamer tarball
+### Rebuilding the plugin tarball
 
-The tarball `gst-plugins-rs-rpi.tar.gz` (82 MB) contains `gst-plugin-webrtc`
-compiled for `aarch64-linux-gnu`. It extracts to `/opt/gst-plugins-rs/`.
-The setup script always downloads the latest tarball from the `develop` branch
-of [`reachy-mini-os`](https://github.com/pollen-robotics/reachy-mini-os) during
-install — this keeps it in sync with the GStreamer version Trixie's apt installs.
+Not needed normally: dispatch the `Build gst-plugins-rs` workflow in
+`reachy-mini-os` with a `gst-plugins-rs` tag, which publishes a release
+asset and its sha256. To build locally on a Pi (slow, needs a recent Rust
+toolchain):
 
-To rebuild (on a Pi or cross-compile):
 ```bash
-git clone https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git
-cd gst-plugins-rs && git checkout <version-tag>
-cargo cinstall -p gst-plugin-webrtc --prefix=/opt/gst-plugins-rs --release
-tar -czf gst-plugins-rs-rpi.tar.gz -C / opt/gst-plugins-rs
+git clone --depth 1 --branch gstreamer-1.29.2 https://github.com/GStreamer/gst-plugins-rs.git
+cd gst-plugins-rs
+cargo build --release --locked -p gst-plugin-webrtc -p gst-plugin-rtp -p gst-plugin-tracers
 ```
 
-
+Then copy the three `.so` files from `target/release/` to
+`/opt/gst-plugins-rs/lib/aarch64-linux-gnu/gstreamer-1.0/`.
