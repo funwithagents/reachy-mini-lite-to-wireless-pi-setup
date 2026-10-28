@@ -127,13 +127,12 @@ if ($Force -or -not (Test-Path $SetupScriptPath)) {
 $RuncmdEntry = "  - [ bash, /boot/firmware/reachy-mini-setup.sh ]"
 $RuncmdMarker = "reachy-mini-setup.sh"
 
+# user-data is always written with WriteAllText: it uses UTF-8 without a BOM
+# and keeps LF line endings, whereas Set-Content -Encoding UTF8 on Windows
+# PowerShell 5.1 adds a BOM, and cloud-init then no longer sees #cloud-config.
 if (-not (Test-Path $UserDataPath)) {
     # No user-data yet — write a minimal cloud-config
-    @"
-#cloud-config
-runcmd:
-$RuncmdEntry
-"@ | Set-Content -Path $UserDataPath -Encoding UTF8
+    [System.IO.File]::WriteAllText($UserDataPath, "#cloud-config`nruncmd:`n$RuncmdEntry`n")
     Write-Host "Created user-data with runcmd entry."
 } else {
     $existing = Get-Content -Path $UserDataPath -Raw
@@ -141,7 +140,7 @@ $RuncmdEntry
     if ($existing -match [regex]::Escape($RuncmdMarker)) {
         if ($Force) {
             # Replace only the reachy-mini line in-place
-            $updated = $existing -replace "(?m)^\s*-\s*\[?\s*bash,\s*/boot/reachy-mini-setup\.sh.*$", $RuncmdEntry
+            $updated = $existing -replace "(?m)^[ \t]*-[ \t]*\[?[ \t]*bash,[ \t]*/boot/(firmware/)?reachy-mini-setup\.sh[^\r\n]*", $RuncmdEntry
             [System.IO.File]::WriteAllText($UserDataPath, $updated)
             Write-Host "Updated existing runcmd entry in user-data."
         } else {
@@ -150,9 +149,25 @@ $RuncmdEntry
     } else {
         # Append runcmd block or add to existing runcmd section
         if ($existing -match "(?m)^runcmd:") {
-            # Insert our line after the runcmd: header
-            $updated = $existing -replace "(?m)^(runcmd:\s*\r?\n)", "`$1$RuncmdEntry`n"
-            [System.IO.File]::WriteAllText($UserDataPath, $updated)
+            # Append as the LAST item of the existing runcmd list. Imager puts
+            # `systemctl enable --now ssh` there, and the setup script ends with a
+            # reboot, so it must run after everything else cloud-init queued.
+            $lines = $existing.TrimEnd("`r", "`n") -split "\r?\n"
+            $out = New-Object System.Collections.Generic.List[string]
+            $inRuncmd = $false
+            foreach ($line in $lines) {
+                if ($line -match "^runcmd:") {
+                    $inRuncmd = $true
+                } elseif ($inRuncmd -and $line -notmatch "^\s*-" -and $line -notmatch "^\s*$") {
+                    $out.Add($RuncmdEntry)
+                    $inRuncmd = $false
+                }
+                $out.Add($line)
+            }
+            if ($inRuncmd) {
+                $out.Add($RuncmdEntry)
+            }
+            [System.IO.File]::WriteAllText($UserDataPath, ($out -join "`n") + "`n")
             Write-Host "Appended runcmd entry to existing runcmd section in user-data."
         } else {
             # No runcmd section — append one
